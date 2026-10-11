@@ -1,0 +1,195 @@
+extends CharacterBody3D
+
+@export var unit_attribute: String = "Mechanical"
+
+@export var speed: float = 3.0
+@export var attack_range: float = 20.0
+@export var damage: float = 30.0
+@export var attack_rate: float = 1.5
+
+
+var current_target: Node3D = null
+var attack_timer: float = 0.0
+
+var base_speed: float
+var base_attack_speed: float
+
+func _ready():
+	add_to_group("Targetable")
+	base_speed = speed
+	if "attack_speed" in self:
+		base_attack_speed = self.get("attack_speed")
+
+func _physics_process(delta):
+	if not is_on_floor():
+		velocity.y -= 9.8 * delta
+		
+	if has_meta("stealth_revealed_timer"):
+		var __s_timer = get_meta("stealth_revealed_timer", 0.0)
+		if __s_timer > 0.0:
+			set_meta("stealth_revealed_timer", max(0.0, __s_timer - delta))
+		
+	if not "target_recheck_timer" in self:
+		set_meta("target_recheck", 1.0)
+	var __target_timer = get_meta("target_recheck") if has_meta("target_recheck") else 1.0
+	__target_timer -= delta
+	set_meta("target_recheck", __target_timer)
+	
+	var target_is_dead = false
+	if current_target != null:
+		var target_hc = current_target.get_node_or_null("HealthComponent")
+		if (target_hc and target_hc.is_dead) or not current_target.is_in_group("Targetable"):
+			target_is_dead = true
+			
+	if current_target == null or not is_instance_valid(current_target) or target_is_dead or __target_timer <= 0.0:
+		if __target_timer <= 0.0 or target_is_dead: set_meta("target_recheck", 1.0)
+		find_new_target()
+		
+	var is_moving = false
+	if current_target != null:
+		var dist = global_position.distance_to(current_target.global_position)
+		var effective_range = attack_range
+		if "Base" in current_target.name:
+			effective_range += 5.5
+		elif "Tower" in current_target.name or "CommandBay" in current_target.name:
+			effective_range += 2.5
+			
+		if dist > effective_range:
+			var next_path_pos = current_target.global_position
+			var new_velocity = global_position.direction_to(next_path_pos) * speed
+			new_velocity.y = velocity.y
+			velocity = new_velocity
+			# --- Separation / Collision Avoidance ---
+			var my_team = ""
+			for g in get_groups():
+				if g.begins_with("Side"): my_team = g
+			var space_state = get_world_3d().direct_space_state
+			var query = PhysicsShapeQueryParameters3D.new()
+			var shape = SphereShape3D.new()
+			shape.radius = 1.2
+			query.shape = shape
+			query.transform = global_transform
+			var results = space_state.intersect_shape(query)
+			var separation = Vector3.ZERO
+			var reach_count = 0
+			for res in results:
+				var col = res.collider
+				if col != self and col.is_in_group(my_team):
+					if "Reach" in self.name and "Reach" in col.name: reach_count += 1
+					var push = global_position - col.global_position
+					push.y = 0
+					var dist_to_col = push.length()
+					if dist_to_col < 1.2 and dist_to_col > 0.01:
+						separation += push.normalized() * (1.2 - dist_to_col)
+			velocity += separation * speed * 2.0
+			
+			if "Reach" in self.name:
+				var synergy = min(reach_count, 5) * 0.15 # Up to +75% speed and attack speed
+				speed = base_speed * (1.0 + synergy)
+				if "attack_speed" in self:
+					self.set("attack_speed", base_attack_speed * (1.0 + synergy))
+				var r_mesh = get_node_or_null("MeshInstance3D")
+				if not r_mesh: r_mesh = get_node_or_null("VisualPivot")
+				if r_mesh:
+					var target_scale = 1.0 + (synergy * 0.6)
+					r_mesh.scale = r_mesh.scale.lerp(Vector3(target_scale, target_scale, target_scale), 0.1)
+			is_moving = true
+		else:
+			velocity.x = move_toward(velocity.x, 0, speed)
+			velocity.z = move_toward(velocity.z, 0, speed)
+			
+			attack_timer += delta
+			var effective_rate = max(0.1, attack_rate)
+			if attack_timer >= effective_rate:
+				attack_timer = 0.0
+				shoot()
+	else:
+		velocity.x = move_toward(velocity.x, 0, speed)
+		velocity.z = move_toward(velocity.z, 0, speed)
+
+	var horiz_vel = Vector3(velocity.x, 0, velocity.z)
+	var anim_mesh = get_node_or_null("MeshInstance3D")
+	if not anim_mesh: anim_mesh = get_node_or_null("VisualPivot")
+	if horiz_vel.length() > 0.1:
+		var look_target = global_position + horiz_vel
+		if global_position.distance_to(look_target) > 0.1:
+			look_at(look_target, Vector3.UP)
+		if anim_mesh:
+			var t = Time.get_ticks_msec() / 1000.0 * speed * 2.0
+			anim_mesh.rotation.z = sin(t) * 0.08
+			anim_mesh.rotation.x = cos(t) * 0.08
+	else:
+		if current_target != null and is_instance_valid(current_target):
+			var look_target = current_target.global_position
+			look_target.y = global_position.y
+			if global_position.distance_to(look_target) > 0.1:
+				look_at(look_target, Vector3.UP)
+		if anim_mesh:
+			anim_mesh.rotation.z = lerp(anim_mesh.rotation.z, 0.0, 10.0 * delta)
+			anim_mesh.rotation.x = lerp(anim_mesh.rotation.x, 0.0, 10.0 * delta)
+			
+	if anim_mesh:
+		anim_mesh.position.z = lerp(anim_mesh.position.z, 0.0, 10.0 * delta)
+	# Anti-stuck wall sliding
+	if is_on_wall():
+		var wall_normal = get_wall_normal()
+		if wall_normal.length() < 0.1: wall_normal = Vector3.UP
+		var slide_vel = velocity.slide(wall_normal)
+		if slide_vel.length() < speed * 0.5:
+			var perp = Vector3(wall_normal.z, 0, -wall_normal.x)
+			velocity += perp * speed * 1.5
+	
+	move_and_slide()
+	
+	var ap = get_node_or_null("AnimationPlayer")
+	if ap:
+		if ap.current_animation == "attack" and ap.is_playing():
+			pass
+		elif is_moving:
+			if ap.has_animation("walk") and ap.current_animation != "walk":
+				ap.play("walk", 0.2, speed * 0.5)
+		else:
+			if ap.has_animation("idle") and ap.current_animation != "idle":
+				ap.play("idle", 0.2)
+
+var projectile_scene = preload("res://Scenes/Projectile.tscn")
+
+func shoot():
+	set_meta("stealth_revealed_timer", 2.0)
+	if projectile_scene:
+		var proj = projectile_scene.instantiate()
+		get_tree().current_scene.add_child(proj)
+		proj.global_position = global_position + Vector3(0, 2.0, 0)
+		proj.target = current_target
+		proj.set("damage", damage)
+		proj.set("speed", 25.0)
+		
+		# Cannon recoil kick
+		var anim_mesh = get_node_or_null("MeshInstance3D")
+		if not anim_mesh: anim_mesh = get_node_or_null("VisualPivot")
+		if anim_mesh:
+			anim_mesh.position.z += 0.35
+
+func find_new_target():
+	current_target = null
+	var my_team = ""
+	for g in get_groups():
+		if g.begins_with("Side"): my_team = g
+	var enemies = []
+	if my_team != "":
+		for node in get_tree().get_nodes_in_group("Targetable"):
+			if not node.is_in_group(my_team) and is_instance_valid(node) and node != self:
+				enemies.append(node)
+	var closest_dist = 99999.0
+	for e in enemies:
+		if is_instance_valid(e):
+			var target_hc = e.get_node_or_null("HealthComponent")
+			if target_hc and target_hc.is_dead: continue
+			if GameState.is_unit_stealthed_from(e, self): continue
+			var d = global_position.distance_to(e.global_position)
+			if d < closest_dist:
+				closest_dist = d
+				current_target = e
+
+
+
